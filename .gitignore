@@ -88,3 +88,6 @@ temp/
 # ----------------------------
 *.pid
 docker-data/
+
+backend/ml/*.pkl
+backend/ml/*.joblib
