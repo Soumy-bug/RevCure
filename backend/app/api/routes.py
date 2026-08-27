@@ -1,3 +1,4 @@
+from datetime import datetime, timezone
 from typing import List, Optional
 from fastapi import APIRouter, Depends, Query, HTTPException, Request, status
 from sqlalchemy import text
@@ -12,10 +13,13 @@ from app.database import crud
 from app.models.schemas import (
     EventCreate, EventResponse, RiskAssessmentResponse,
     RazorpayWebhookPayload, WebhookResponse,
-    RecoveryAttemptResponse,
+    RecoveryAttemptResponse, RecoveryMetricsResponse,
+    DiagnosisResultResponse,
 )
 from app.services.detector import assess_risk
 from app.services.recovery import decide_action
+from app.services.diagnosis import diagnose
+from app.services.razorpay_client import create_retry_order
 
 logger = logging.getLogger("revcure.webhook")
 
@@ -240,9 +244,10 @@ async def razorpay_webhook(
     raw_body = await request.body()
 
     # ── Verify X-Razorpay-Signature ───────────────────────────────────
+    # Uses RAZORPAY_WEBHOOK_SECRET (separate from the API key secret).
     # Skip verification in development if no secret is configured.
-    razorpay_secret = settings.RAZORPAY_KEY_SECRET
-    if razorpay_secret:
+    webhook_secret = settings.RAZORPAY_WEBHOOK_SECRET
+    if webhook_secret:
         signature = request.headers.get("x-razorpay-signature", "")
         if not signature:
             logger.warning("Webhook missing X-Razorpay-Signature header")
@@ -250,8 +255,8 @@ async def razorpay_webhook(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Missing webhook signature",
             )
-        expected = hmac.new(
-            razorpay_secret.encode("utf-8"),
+        expected = hmac.HMAC(
+            webhook_secret.encode("utf-8"),
             raw_body,
             hashlib.sha256,
         ).hexdigest()
@@ -263,12 +268,15 @@ async def razorpay_webhook(
             )
         logger.info("Webhook signature verified")
     else:
-        logger.debug("Razorpay secret not configured — skipping signature check (dev mode)")
+        logger.debug("RAZORPAY_WEBHOOK_SECRET not configured — skipping signature check (dev mode)")
 
     # ── Parse payload ─────────────────────────────────────────────────
     import json
     payload_dict = json.loads(raw_body)
     payload = RazorpayWebhookPayload.model_validate(payload_dict)
+
+    # Extract Razorpay's unique event ID for deduplication
+    razorpay_event_id = payload_dict.get("id")
 
     # Extract payment entity from the Razorpay payload
     payment_entity = None
@@ -301,17 +309,22 @@ async def razorpay_webhook(
             detail="Razorpay payload missing payment entity or id",
         )
 
-    # ── Duplicate check ──────────────────────────────────────────────
-    is_duplicate = await crud.event_exists(db, payment_id, internal_event_type)
-    if is_duplicate:
-        logger.info("Duplicate webhook skipped: %s / %s", payment_id, internal_event_type)
-        return WebhookResponse(
-            status="duplicate",
-            event_type=internal_event_type,
-            payment_id=payment_id,
-            duplicate=True,
-            risk_assessed=False,
-        )
+    # ── Duplicate check (by Razorpay event ID) ────────────────────────
+    # Razorpay retries webhooks with the same event ID on failure.
+    # Using the unique event ID prevents processing duplicates while
+    # still allowing legitimate events of the same type for the same
+    # payment (e.g. multiple PAYMENT_FAILED events).
+    if razorpay_event_id:
+        is_duplicate = await crud.webhook_event_exists(db, razorpay_event_id)
+        if is_duplicate:
+            logger.info("Duplicate webhook skipped: event_id=%s", razorpay_event_id)
+            return WebhookResponse(
+                status="duplicate",
+                event_type=internal_event_type,
+                payment_id=payment_id,
+                duplicate=True,
+                risk_assessed=False,
+            )
 
     # ── Store event ──────────────────────────────────────────────────
     event_in = EventCreate(
@@ -319,8 +332,43 @@ async def razorpay_webhook(
         event_type=internal_event_type,
         event_payload=payment_entity or {},
     )
-    await crud.create_event(db, event_in)
-    logger.info("Stored event: %s / %s", payment_id, internal_event_type)
+    await crud.create_event(db, event_in, webhook_event_id=razorpay_event_id)
+    logger.info("Stored event: %s / %s (event_id=%s)", payment_id, internal_event_type, razorpay_event_id)
+
+    # ── Check if this captured payment closes a recovery retry ─────────
+    # When a retry order is captured, Razorpay sends a new payment.captured
+    # webhook with a NEW payment_id.  We match via order_id to link it
+    # back to the original failed payment's recovery attempt.
+    recovery_marked = False
+    if internal_event_type == "PAYMENT_SUCCESS" and payment_entity:
+        captured_order_id = payment_entity.get("order_id")
+        if captured_order_id:
+            pending_retry = await crud.find_pending_retry_by_order_id(db, captured_order_id)
+            if pending_retry:
+                original_payment_id = pending_retry.payment_id
+                await crud.mark_recovery_recovered(
+                    db, pending_retry.id, payment_id,
+                )
+                # Record a RECOVERY_SUCCEEDED event against the ORIGINAL payment
+                await crud.create_event(
+                    db,
+                    EventCreate(
+                        payment_id=original_payment_id,
+                        event_type="RECOVERY_SUCCEEDED",
+                        event_payload={
+                            "captured_payment_id": payment_id,
+                            "order_id": captured_order_id,
+                            "amount": pending_retry.amount,
+                            "recovery_attempt_id": pending_retry.id,
+                        },
+                    ),
+                )
+                recovery_marked = True
+                logger.info(
+                    "Recovery succeeded for %s: captured=%s order=%s amount=%s",
+                    original_payment_id, payment_id, captured_order_id,
+                    pending_retry.amount,
+                )
 
     # ── Trigger risk assessment ──────────────────────────────────────
     risk_assessed = False
@@ -411,7 +459,80 @@ async def recover_payment(
         previous_attempts=previous_attempts,
     )
 
-    # ── Execute action as auditable event ─────────────────────────────
+    # ── Run constrained diagnosis (explain/contextualize only) ────────
+    # The diagnosis classifies the payment situation but NEVER executes
+    # actions or bypasses the deterministic recovery policy.
+    diagnosis = diagnose(event_dicts, risk_score, risk_label)
+
+    # ── No-action decisions: return without persisting ────────────────
+    # When the decision engine says "no_action", we do NOT create an
+    # event or a recovery_attempt row — this prevents burning the
+    # bounded attempt counter on informational decisions.
+    if decision.action == "no_action":
+        logger.info("No recovery action for %s: %s", payment_id, decision.reason)
+        return RecoveryAttemptResponse(
+            id=0,
+            payment_id=payment_id,
+            action="no_action",
+            status="executed",
+            reason=decision.reason,
+            attempt_number=decision.attempt_number,
+            created_at=datetime.now(timezone.utc),
+            diagnosis=DiagnosisResultResponse(
+                category=diagnosis.category,
+                confidence=diagnosis.confidence,
+                explanation=diagnosis.explanation,
+                supporting_event=diagnosis.supporting_event,
+            ),
+        )
+
+    # ── Execute action ────────────────────────────────────────────────
+    action_status = "executed"
+    action_reason = decision.reason
+    action_payload = {
+        "action": decision.action,
+        "reason": decision.reason,
+        "attempt_number": decision.attempt_number,
+        "risk_score": risk_score,
+        "risk_label": risk_label,
+    }
+    retry_order_id = None
+    amount = 0
+
+    # For retry_payment: call the Razorpay Orders API to create a retry order
+    if decision.action == "retry_payment":
+        # Extract amount from the latest failed payment event
+        amount = 0
+        for e in reversed(events):
+            payload = e.event_payload or {}
+            if payload.get("amount"):
+                try:
+                    amount = int(payload["amount"])
+                except (TypeError, ValueError):
+                    pass
+                break
+
+        if amount <= 0:
+            action_status = "failed"
+            action_reason = "Cannot retry: payment amount not found in event history"
+            logger.warning("Retry skipped for %s: no amount in events", payment_id)
+        else:
+            razorpay_result = await create_retry_order(
+                payment_id=payment_id,
+                amount=amount,
+            )
+            if razorpay_result.success:
+                action_status = "executed"
+                action_reason = (
+                    f"Retry order created (amount={amount} paise)"
+                )
+                retry_order_id = razorpay_result.order_id
+            else:
+                action_status = "failed"
+                action_reason = razorpay_result.error or "Payment gateway request failed"
+                retry_order_id = None
+
+    # Map action to event type
     event_type_for_action = {
         "retry_payment":  "RETRY_PAYMENT",
         "send_reminder":  "REMINDER_SENT",
@@ -419,13 +540,7 @@ async def recover_payment(
     }
     action_event_type = event_type_for_action.get(decision.action)
     if action_event_type:
-        action_payload = {
-            "action": decision.action,
-            "reason": decision.reason,
-            "attempt_number": decision.attempt_number,
-            "risk_score": risk_score,
-            "risk_label": risk_label,
-        }
+        action_payload["final_status"] = action_status
         await crud.create_event(
             db,
             EventCreate(
@@ -434,21 +549,62 @@ async def recover_payment(
                 event_payload=action_payload,
             ),
         )
-        logger.info("Recorded %s event for %s", action_event_type, payment_id)
+        logger.info(
+            "Recorded %s event for %s (status=%s)",
+            action_event_type, payment_id, action_status,
+        )
 
     # ── Record attempt ────────────────────────────────────────────────
+    retry_amount = amount if decision.action == "retry_payment" else None
+    retry_order = retry_order_id if decision.action == "retry_payment" else None
+    attempt_outcome = "pending" if (decision.action == "retry_payment" and action_status == "executed") else action_status
+
     attempt = await crud.create_recovery_attempt(
         db,
         payment_id=payment_id,
         action=decision.action,
-        status="executed" if decision.action != "no_action" else "skipped",
-        reason=decision.reason,
+        status=action_status,
+        reason=action_reason,
         attempt_number=decision.attempt_number,
+        amount=retry_amount,
+        razorpay_order_id=retry_order,
+        outcome=attempt_outcome,
     )
 
     logger.info(
-        "Recovery %s for %s: action=%s reason=%s",
-        attempt.status, payment_id, decision.action, decision.reason,
+        "Recovery %s for %s: action=%s reason=%s (diagnosis=%s)",
+        attempt.status, payment_id, decision.action, decision.reason, diagnosis.category,
     )
 
-    return attempt
+    # Attach diagnosis to the persisted attempt response
+    response = RecoveryAttemptResponse.model_validate(attempt)
+    response.diagnosis = DiagnosisResultResponse(
+        category=diagnosis.category,
+        confidence=diagnosis.confidence,
+        explanation=diagnosis.explanation,
+        supporting_event=diagnosis.supporting_event,
+    )
+    return response
+
+
+# ── Recovery Metrics Endpoint ─────────────────────────────────────────
+
+@router.get(
+    "/recovery/metrics",
+    response_model=RecoveryMetricsResponse,
+    tags=["Recovery"],
+    summary="Get recovery outcome metrics",
+)
+async def get_recovery_metrics(
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Return honest recovery metrics based on actual payment capture outcomes.
+
+    - money_at_risk:    total amount (paise) from failed-payment retry attempts
+    - money_recovered:  total amount (paise) from retry attempts where payment was captured
+    - recovery_rate:    money_recovered / money_at_risk
+    - eligible_payments: count of distinct payments with retry attempts
+    - recovered_payments: count of distinct payments actually recovered
+    """
+    return await crud.get_recovery_metrics(db)

@@ -73,22 +73,10 @@ def decide_action(
 
     next_attempt = previous_attempts + 1
 
-    # ── No risk / already succeeded ───────────────────────────────────
-    if risk_label == "none":
-        return RecoveryDecision(
-            action=ACTION_NONE,
-            reason="No risk detected — payment is healthy",
-            attempt_number=next_attempt,
-        )
-
-    if _has_event_type(events, "PAYMENT_SUCCESS", "PAYMENT_CAPTURED"):
-        return RecoveryDecision(
-            action=ACTION_NONE,
-            reason="Payment already succeeded — no recovery needed",
-            attempt_number=next_attempt,
-        )
-
-    # ── Dispute / chargeback → always escalate ────────────────────────
+    # ── Dispute / chargeback → always escalate (before success check) ──
+    # Active disputes and refunds must be handled regardless of payment
+    # status — a payment that "succeeded" but has an open dispute still
+    # needs human review.
     if _has_event_type(events, "DISPUTE_OPENED", "CHARGEBACK"):
         return RecoveryDecision(
             action=ACTION_ESCALATE,
@@ -101,6 +89,21 @@ def decide_action(
         return RecoveryDecision(
             action=ACTION_REMIND,
             reason="Refund pending — send customer reminder/confirmation",
+            attempt_number=next_attempt,
+        )
+
+    # ── No risk / already succeeded ───────────────────────────────────
+    if risk_label == "none":
+        return RecoveryDecision(
+            action=ACTION_NONE,
+            reason="No risk detected — payment is healthy",
+            attempt_number=next_attempt,
+        )
+
+    if _has_event_type(events, "PAYMENT_SUCCESS", "PAYMENT_CAPTURED"):
+        return RecoveryDecision(
+            action=ACTION_NONE,
+            reason="Payment already succeeded — no recovery needed",
             attempt_number=next_attempt,
         )
 

@@ -1,5 +1,5 @@
 from typing import List, Optional, Union, Dict, Any
-from sqlalchemy import select
+from sqlalchemy import select, func as sqlfunc, case
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.database.models import Event, RiskAssessment, RecoveryAttempt
 from app.models.schemas import EventCreate
@@ -7,11 +7,16 @@ from app.models.schemas import EventCreate
 async def create_event(
     db: AsyncSession,
     event_data: Union[EventCreate, Dict[str, Any]],
+    webhook_event_id: Optional[str] = None,
 ) -> Event:
     """
     Creates and commits a new audit Event to the database.
     Accepts either an EventCreate Pydantic schema or a dictionary.
     Includes explicit rollback on exception and refresh after commit.
+
+    Args:
+        webhook_event_id: Razorpay's unique event ID for deduplication.
+                          Only stored for webhook-originated events.
     """
     if isinstance(event_data, EventCreate):
         payment_id = event_data.payment_id
@@ -26,6 +31,7 @@ async def create_event(
         payment_id=payment_id,
         event_type=event_type,
         event_payload=event_payload,
+        webhook_event_id=webhook_event_id,
     )
 
     db.add(event)
@@ -161,6 +167,19 @@ async def event_exists(
     return result.scalar()
 
 
+async def webhook_event_exists(
+    db: AsyncSession,
+    webhook_event_id: str,
+) -> bool:
+    """Return True if an event with this Razorpay webhook_event_id already exists."""
+    from sqlalchemy import exists
+    stmt = select(exists().where(
+        Event.webhook_event_id == webhook_event_id,
+    ))
+    result = await db.execute(stmt)
+    return result.scalar()
+
+
 # ── Recovery Attempt CRUD ──────────────────────────────────────────────
 
 async def count_recovery_attempts(
@@ -183,6 +202,9 @@ async def create_recovery_attempt(
     status: str,
     reason: str,
     attempt_number: int,
+    amount: Optional[int] = None,
+    razorpay_order_id: Optional[str] = None,
+    outcome: str = "executed",
 ) -> RecoveryAttempt:
     """Persist a new recovery attempt."""
     attempt = RecoveryAttempt(
@@ -191,6 +213,9 @@ async def create_recovery_attempt(
         status=status,
         reason=reason,
         attempt_number=attempt_number,
+        amount=amount,
+        razorpay_order_id=razorpay_order_id,
+        outcome=outcome,
     )
     db.add(attempt)
     try:
@@ -200,6 +225,101 @@ async def create_recovery_attempt(
     except Exception:
         await db.rollback()
         raise
+
+
+async def find_pending_retry_by_order_id(
+    db: AsyncSession,
+    razorpay_order_id: str,
+) -> Optional[RecoveryAttempt]:
+    """Find the pending retry attempt for a given Razorpay order ID."""
+    stmt = select(RecoveryAttempt).where(
+        RecoveryAttempt.razorpay_order_id == razorpay_order_id,
+        RecoveryAttempt.action == "retry_payment",
+        RecoveryAttempt.outcome == "pending",
+    ).order_by(RecoveryAttempt.id.desc()).limit(1)
+    result = await db.execute(stmt)
+    return result.scalar_one_or_none()
+
+
+async def mark_recovery_recovered(
+    db: AsyncSession,
+    attempt_id: int,
+    captured_payment_id: str,
+) -> None:
+    """Mark a recovery attempt as recovered and store the captured payment ID."""
+    from datetime import datetime, timezone
+    stmt = select(RecoveryAttempt).where(RecoveryAttempt.id == attempt_id)
+    result = await db.execute(stmt)
+    attempt = result.scalar_one_or_none()
+    if attempt:
+        attempt.outcome = "recovered"
+        attempt.recovered_at = datetime.now(timezone.utc)
+        # Store the captured payment_id in the reason field (avoids schema change)
+        attempt.reason = f"{attempt.reason or ''} | captured={captured_payment_id}".strip(" |")
+        try:
+            await db.commit()
+        except Exception:
+            await db.rollback()
+            raise
+
+
+async def get_recovery_metrics(db: AsyncSession) -> Dict[str, Any]:
+    """Compute recovery metrics for the dashboard.
+
+    Returns:
+        money_at_risk:    sum of amounts from failed recovery retry attempts
+                          (pending + recovered + failed — any retry_payment with an amount)
+        money_recovered:  sum of amounts from retry attempts whose outcome = recovered
+        recovery_rate:    money_recovered / money_at_risk (0.0 if no at-risk)
+        eligible_payments: count of distinct payments with at least one retry_payment attempt
+        recovered_payments: count of distinct payments that have at least one recovered attempt
+    """
+    # Eligible payments = distinct payment_ids with at least one retry_payment attempt
+    eligible_q = await db.execute(
+        select(sqlfunc.count(sqlfunc.distinct(RecoveryAttempt.payment_id))).where(
+            RecoveryAttempt.action == "retry_payment",
+            RecoveryAttempt.amount.isnot(None),
+        )
+    )
+    eligible_payments = eligible_q.scalar() or 0
+
+    # Recovered payments = distinct payment_ids with at least one outcome=recovered
+    recovered_q = await db.execute(
+        select(sqlfunc.count(sqlfunc.distinct(RecoveryAttempt.payment_id))).where(
+            RecoveryAttempt.action == "retry_payment",
+            RecoveryAttempt.outcome == "recovered",
+        )
+    )
+    recovered_payments = recovered_q.scalar() or 0
+
+    # money_at_risk = sum of amounts from all retry attempts with an amount set
+    at_risk_q = await db.execute(
+        select(sqlfunc.coalesce(sqlfunc.sum(RecoveryAttempt.amount), 0)).where(
+            RecoveryAttempt.action == "retry_payment",
+            RecoveryAttempt.amount.isnot(None),
+        )
+    )
+    money_at_risk = at_risk_q.scalar() or 0
+
+    # money_recovered = sum of amounts from retry attempts where outcome = recovered
+    recovered_q2 = await db.execute(
+        select(sqlfunc.coalesce(sqlfunc.sum(RecoveryAttempt.amount), 0)).where(
+            RecoveryAttempt.action == "retry_payment",
+            RecoveryAttempt.outcome == "recovered",
+            RecoveryAttempt.amount.isnot(None),
+        )
+    )
+    money_recovered = recovered_q2.scalar() or 0
+
+    recovery_rate = (money_recovered / money_at_risk) if money_at_risk > 0 else 0.0
+
+    return {
+        "money_at_risk": money_at_risk,
+        "money_recovered": money_recovered,
+        "recovery_rate": round(recovery_rate, 4),
+        "eligible_payments": eligible_payments,
+        "recovered_payments": recovered_payments,
+    }
 
 
 async def get_recovery_history(

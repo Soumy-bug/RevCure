@@ -20,6 +20,9 @@ class Event(Base):
         JSONB().with_variant(JSON(), "sqlite"),
         nullable=True,
     )
+    webhook_event_id: Mapped[Optional[str]] = mapped_column(
+        String(255), index=True, nullable=True, unique=True,
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         server_default=func.now(),
@@ -30,7 +33,7 @@ class Event(Base):
 class RecoveryAttempt(Base):
     """
     Records each recovery action taken for a payment.
-    Enables bounding (max attempts) and audit trail.
+    Enables bounding (max attempts), audit trail, and outcome tracking.
     """
     __tablename__ = "recovery_attempts"
 
@@ -44,6 +47,13 @@ class RecoveryAttempt(Base):
         DateTime(timezone=True),
         server_default=func.now(),
         nullable=False,
+    )
+    # ── Outcome tracking (Track 04) ────────────────────────────────────
+    amount: Mapped[Optional[int]] = mapped_column(Integer, nullable=True, default=None)
+    razorpay_order_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True, default=None)
+    outcome: Mapped[str] = mapped_column(String(20), nullable=False, default="executed")
+    recovered_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True, default=None,
     )
 
 
