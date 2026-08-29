@@ -54,18 +54,56 @@ export default function Escalations() {
         const totalActions = recoveryEvents.length;
         const isCritical = data.risk?.risk_label === "critical";
 
+        // Check for actual ESCALATED event (source of truth)
+        const escalatedEvent = data.events.find((e) => e.event_type === "ESCALATED");
+        const hasEscalated = !!escalatedEvent;
+
         let escalationType: EscalationEntry["escalation_type"] | null = null;
         let reason = "";
 
-        if (totalActions >= 5) {
+        if (hasEscalated) {
+          // Use the ESCALATED event's reason to determine type
+          const escReason = escalatedEvent!.event_payload?.reason || "";
+          if (escReason.includes("Hard limit") || escReason.includes("limit reached")) {
+            escalationType = "max_actions";
+            reason = escReason;
+          } else if (escReason.includes("retry") || escReason.includes("Retry")) {
+            escalationType = "max_retries";
+            reason = escReason;
+          } else if (escReason.includes("critical") || escReason.includes("Critical")) {
+            escalationType = "critical_risk";
+            reason = escReason;
+          } else if (escReason.includes("dispute") || escReason.includes("Dispute")) {
+            escalationType = "critical_risk";
+            reason = escReason;
+          } else {
+            // Fallback: infer from state
+            if (totalActions >= 5) {
+              escalationType = "max_actions";
+              reason = `Maximum recovery actions (${totalActions}/5) reached`;
+            } else if (retryCount >= 3) {
+              escalationType = "max_retries";
+              reason = `Payment retry limit (${retryCount}/3) reached`;
+            } else if (isCritical) {
+              escalationType = "critical_risk";
+              reason = data.risk?.reasons?.[0] || "Critical risk level detected";
+            } else {
+              escalationType = "critical_risk";
+              reason = escReason || "Escalated for manual review";
+            }
+          }
+        } else if (totalActions >= 5) {
+          // At action limit but not yet escalated — needs attention
           escalationType = "max_actions";
-          reason = `Maximum recovery actions (${totalActions}/5) reached`;
+          reason = `Maximum recovery actions (${totalActions}/5) reached — requires escalation`;
         } else if (retryCount >= 3) {
+          // At retry limit but not yet escalated — needs attention
           escalationType = "max_retries";
-          reason = `Payment retry limit (${retryCount}/3) reached`;
+          reason = `Payment retry limit (${retryCount}/3) reached — next action is escalation`;
         } else if (isCritical) {
+          // Critical risk but not yet escalated — needs attention
           escalationType = "critical_risk";
-          reason = data.risk?.reasons?.[0] || "Critical risk level detected";
+          reason = data.risk?.reasons?.[0] || "Critical risk level detected — escalation recommended";
         }
 
         if (escalationType) {

@@ -26,6 +26,7 @@ export interface RecoveryAttemptResponse {
   razorpay_order_id: string | null;
   outcome: string;
   recovered_at: string | null;
+  next_action: string | null;
 }
 
 export interface RecoveryMetrics {
@@ -43,6 +44,7 @@ export interface RecoveryResult {
   reason: string | null;
   attempt_number: number;
   created_at: string;
+  next_action: string | null;
 }
 
 export type RiskLabel = "none" | "low" | "medium" | "high" | "critical";

@@ -292,12 +292,22 @@ async def get_recovery_metrics(db: AsyncSession) -> Dict[str, Any]:
     )
     recovered_payments = recovered_q.scalar() or 0
 
-    # money_at_risk = sum of amounts from all retry attempts with an amount set
-    at_risk_q = await db.execute(
-        select(sqlfunc.coalesce(sqlfunc.sum(RecoveryAttempt.amount), 0)).where(
+    # money_at_risk = sum of amounts from retry attempts, counted once per payment
+    # (a payment retried 3 times still contributes its original amount only once)
+    subq = (
+        select(
+            RecoveryAttempt.payment_id,
+            sqlfunc.max(RecoveryAttempt.amount).label("max_amount"),
+        )
+        .where(
             RecoveryAttempt.action == "retry_payment",
             RecoveryAttempt.amount.isnot(None),
         )
+        .group_by(RecoveryAttempt.payment_id)
+        .subquery()
+    )
+    at_risk_q = await db.execute(
+        select(sqlfunc.coalesce(sqlfunc.sum(subq.c.max_amount), 0))
     )
     money_at_risk = at_risk_q.scalar() or 0
 

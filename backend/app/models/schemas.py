@@ -81,6 +81,7 @@ class RecoveryAttemptResponse(BaseModel):
     outcome: str = "executed"
     recovered_at: Optional[datetime] = None
     diagnosis: Optional[DiagnosisResultResponse] = None
+    next_action: Optional[str] = Field(None, description="The next executable recovery action, or a terminal state label")
 
 
 # ── Recovery Metrics ───────────────────────────────────────────────────

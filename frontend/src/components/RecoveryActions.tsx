@@ -40,6 +40,7 @@ export default function RecoveryActions({ paymentId, onRecoveryDone }: Props) {
         razorpay_order_id: e.event_payload?.razorpay_order?.order_id || null,
         outcome: e.event_payload?.final_status === "failed" ? "failed" : "executed",
         recovered_at: null,
+        next_action: null,
       }));
       setAttempts(mapped);
     } catch {
@@ -59,6 +60,15 @@ export default function RecoveryActions({ paymentId, onRecoveryDone }: Props) {
       setResult({ success: true, data });
       addToast("success", `Recovery action executed: ${ACTION_LABELS[data.action] || data.action}`);
       await loadAttempts();
+      // Update the most recent attempt with the backend's next_action
+      if (data.next_action) {
+        setAttempts((prev) => {
+          if (prev.length === 0) return prev;
+          const updated = [...prev];
+          updated[updated.length - 1] = { ...updated[updated.length - 1], next_action: data.next_action };
+          return updated;
+        });
+      }
       onRecoveryDone?.();
     } catch (e: unknown) {
       const msg = e instanceof Error ? e.message : "Recovery failed";
@@ -73,7 +83,27 @@ export default function RecoveryActions({ paymentId, onRecoveryDone }: Props) {
   const totalActions = attempts.length;
   const maxRetries = 3;
   const maxActions = 5;
-  const canRetry = retryCount < maxRetries && totalActions < maxActions;
+  const retryLimitReached = retryCount >= maxRetries;
+  const actionLimitReached = totalActions >= maxActions;
+  const canExecute = !retryLimitReached && !actionLimitReached;
+
+  // Determine next action from the most recent backend response, or compute locally
+  const lastNextAction = attempts.length > 0 ? attempts[attempts.length - 1].next_action : null;
+  let nextActionLabel: string;
+  let nextActionColor: string;
+  if (actionLimitReached) {
+    nextActionLabel = "No Further Action";
+    nextActionColor = "var(--red)";
+  } else if (retryLimitReached) {
+    nextActionLabel = "Escalate";
+    nextActionColor = "var(--yellow)";
+  } else if (lastNextAction && lastNextAction !== "Available") {
+    nextActionLabel = lastNextAction;
+    nextActionColor = "var(--green)";
+  } else {
+    nextActionLabel = "Available";
+    nextActionColor = "var(--green)";
+  }
 
   return (
     <div className="recovery-panel">
@@ -82,20 +112,22 @@ export default function RecoveryActions({ paymentId, onRecoveryDone }: Props) {
         <div>
           <div className="section-title">Recovery Action</div>
           <div className="section-subtitle">
-            {totalActions}/{maxActions} actions used \u00B7 {retryCount}/{maxRetries} retries used
+            {totalActions}/{maxActions} actions used · {retryCount}/{maxRetries} retries used
           </div>
         </div>
         <button
-          className={`btn ${canRetry ? "btn-primary" : "btn-secondary"}`}
+          className={`btn ${canExecute ? "btn-primary" : "btn-secondary"}`}
           onClick={handleRecover}
-          disabled={executing || !canRetry}
+          disabled={executing || !canExecute}
         >
           {executing ? (
             <><div className="spinner" style={{ width: 14, height: 14, borderWidth: 2 }} /> Executing...</>
-          ) : canRetry ? (
+          ) : canExecute ? (
             "Run Recovery"
+          ) : actionLimitReached ? (
+            "Action Limit Reached"
           ) : (
-            "Limit Reached"
+            "Retry Limit Reached"
           )}
         </button>
       </div>
@@ -116,13 +148,7 @@ export default function RecoveryActions({ paymentId, onRecoveryDone }: Props) {
         <div className="recovery-info-item">
           <div className="recovery-info-label">Next Action</div>
           <div className="recovery-info-value" style={{ fontSize: 14 }}>
-            {!canRetry && totalActions >= maxActions ? (
-              <span style={{ color: "var(--red)" }}>Escalate</span>
-            ) : !canRetry && retryCount >= maxRetries ? (
-              <span style={{ color: "var(--yellow)" }}>Escalate</span>
-            ) : (
-              <span style={{ color: "var(--green)" }}>{totalActions < maxActions ? "Available" : "None"}</span>
-            )}
+            <span style={{ color: nextActionColor }}>{nextActionLabel}</span>
           </div>
         </div>
       </div>
@@ -142,14 +168,14 @@ export default function RecoveryActions({ paymentId, onRecoveryDone }: Props) {
         <ProgressBar value={totalActions} max={maxActions} color={totalActions >= maxActions ? "var(--red)" : totalActions >= 3 ? "var(--yellow)" : "var(--green)"} />
       </div>
 
-      {!canRetry && totalActions >= maxActions && (
+      {actionLimitReached && (
         <div className="recovery-result error" style={{ marginTop: 14 }}>
-          <div className="recovery-result-label">Maximum Actions Reached</div>
-          <div className="text-sm">All {maxActions} recovery actions have been used. This payment requires manual escalation.</div>
+          <div className="recovery-result-label">Action Limit Reached</div>
+          <div className="text-sm">All {maxActions} recovery actions have been used. This payment requires manual review.</div>
         </div>
       )}
 
-      {!canRetry && retryCount >= maxRetries && totalActions < maxActions && (
+      {retryLimitReached && !actionLimitReached && (
         <div className="recovery-result" style={{ marginTop: 14, background: "var(--yellow-bg)", borderColor: "rgba(253, 203, 110, 0.25)", color: "var(--yellow)" }}>
           <div className="recovery-result-label" style={{ color: "var(--yellow)" }}>Retry Limit Reached</div>
           <div className="text-sm" style={{ color: "var(--text-muted)" }}>

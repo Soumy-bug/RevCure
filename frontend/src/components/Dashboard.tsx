@@ -14,11 +14,12 @@ interface Stats {
   escalated: number;
 }
 
-function formatPaise(amount: number): string {
-  if (amount >= 10000000) return `\u20B9${(amount / 10000000).toFixed(1)}Cr`;
-  if (amount >= 100000) return `\u20B9${(amount / 100000).toFixed(1)}L`;
-  if (amount >= 1000) return `\u20B9${(amount / 1000).toFixed(1)}K`;
-  return `\u20B9${amount}`;
+function formatPaise(paise: number): string {
+  const rupees = paise / 100;
+  if (rupees >= 10000000) return `\u20B9${(rupees / 10000000).toFixed(1)}Cr`;
+  if (rupees >= 100000) return `\u20B9${(rupees / 100000).toFixed(1)}L`;
+  if (rupees >= 1000) return `\u20B9${(rupees / 1000).toFixed(1)}K`;
+  return `\u20B9${Math.round(rupees)}`;
 }
 
 export default function Dashboard() {

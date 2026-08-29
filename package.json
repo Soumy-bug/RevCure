@@ -1,0 +1,11 @@
+{
+  "name": "revcure",
+  "version": "0.1.0",
+  "private": true,
+  "description": "RevCure - Revenue Recovery Dashboard",
+  "scripts": {
+    "dev": "powershell -ExecutionPolicy Bypass -File start.ps1",
+    "dev:seed": "powershell -ExecutionPolicy Bypass -File start.ps1 -Seed",
+    "dev:stop": "powershell -ExecutionPolicy Bypass -File stop.ps1"
+  }
+}

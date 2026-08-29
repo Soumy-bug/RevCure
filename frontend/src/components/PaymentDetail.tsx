@@ -58,7 +58,8 @@ export default function PaymentDetail() {
   const recoveryEvents = events.filter((e) => isRecoveryEvent(e.event_type));
   const retryCount = recoveryEvents.filter((e) => e.event_type === "RETRY_PAYMENT").length;
   const totalActions = recoveryEvents.length;
-  const isEscalated = totalActions >= 5 || retryCount >= 3;
+  const hasEscalated = events.some((e) => e.event_type === "ESCALATED");
+  const hasRecovered = events.some((e) => e.event_type === "RECOVERY_SUCCEEDED");
 
   return (
     <div>
@@ -81,7 +82,7 @@ export default function PaymentDetail() {
               <>
                 <span>Risk:</span>
                 <RiskBadge label={risk.risk_label} />
-                <span style={{ color: "var(--text-dim)" }}>\u00B7</span>
+                <span style={{ color: "var(--text-dim)" }}>·</span>
                 <span>Score: {(risk.risk_score * 100).toFixed(0)}%</span>
               </>
             ) : (
@@ -159,12 +160,14 @@ export default function PaymentDetail() {
             <div className="recovery-info-item">
               <div className="recovery-info-label">Status</div>
               <div className="recovery-info-value">
-                {isEscalated ? (
+                {hasRecovered ? (
+                  <span style={{ color: "var(--green)", fontWeight: 600 }}>Recovered</span>
+                ) : hasEscalated ? (
                   <span style={{ color: "var(--red)", fontWeight: 600 }}>Escalated</span>
                 ) : totalActions > 0 ? (
-                  <span style={{ color: "var(--green)" }}>Active</span>
+                  <span style={{ color: "var(--blue)" }}>In Progress</span>
                 ) : (
-                  <span className="text-muted">None</span>
+                  <span className="text-muted">Not Started</span>
                 )}
               </div>
             </div>

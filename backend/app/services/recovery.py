@@ -67,7 +67,7 @@ def decide_action(
         return RecoveryDecision(
             action=ACTION_NONE,
             reason=f"Hard limit reached: {previous_attempts}/{MAX_TOTAL_ACTIONS} recovery actions already taken",
-            attempt_number=previous_attempts,
+            attempt_number=previous_attempts + 1,
             bounded=True,
         )
 

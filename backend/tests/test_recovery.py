@@ -309,10 +309,10 @@ class TestRecoveryHardLimit:
             assert decision.action == "no_action"
             assert decision.bounded is True
 
-    def test_attempt_number_matches_previous_when_limited(self):
+    def test_attempt_number_matches_next_when_limited(self):
         events = _make_event_dicts([("PAYMENT_FAILED", {"amount": 5000})])
         decision = decide_action(events, 0.8, "critical", previous_attempts=5)
-        assert decision.attempt_number == 5
+        assert decision.attempt_number == 6
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -411,7 +411,7 @@ class TestRecoveryEndpoint:
             assert res.status_code == 200
             body = res.json()
             assert body["action"] == "no_action"
-            assert body["status"] == "executed"
+            assert body["status"] == "not_applicable"
 
             # Verify no recovery attempt was created
             count = await crud.count_recovery_attempts(test_session, "pay_healthy_001")
@@ -813,6 +813,36 @@ class TestRecoveryOutcomeTracking:
         assert metrics["money_recovered"] == 10000  # only pay_m1
         assert metrics["recovery_rate"] == pytest.approx(10000 / 35000, abs=0.01)
 
+    @pytest.mark.asyncio
+    async def test_money_at_risk_counts_unique_payments_not_retries(self, test_session: AsyncSession):
+        """One payment retried 3 times contributes its amount once, not 3x."""
+        # Three retries of the same payment (same payment_id, different attempt_numbers)
+        await crud.create_recovery_attempt(
+            test_session, "pay_multi_retry", "retry_payment", "executed",
+            "r1", attempt_number=1, amount=25000, razorpay_order_id="o1", outcome="pending",
+        )
+        await crud.create_recovery_attempt(
+            test_session, "pay_multi_retry", "retry_payment", "executed",
+            "r2", attempt_number=2, amount=25000, razorpay_order_id="o2", outcome="failed",
+        )
+        await crud.create_recovery_attempt(
+            test_session, "pay_multi_retry", "retry_payment", "executed",
+            "r3", attempt_number=3, amount=25000, razorpay_order_id="o3", outcome="recovered",
+        )
+        # A second, different payment
+        await crud.create_recovery_attempt(
+            test_session, "pay_other", "retry_payment", "executed",
+            "r4", attempt_number=1, amount=10000, razorpay_order_id="o4", outcome="pending",
+        )
+
+        metrics = await crud.get_recovery_metrics(test_session)
+        # money_at_risk: 25000 (pay_multi_retry, counted once) + 10000 (pay_other) = 35000
+        assert metrics["money_at_risk"] == 35000
+        # eligible_payments: 2 distinct payment_ids
+        assert metrics["eligible_payments"] == 2
+        # money_recovered: only pay_multi_retry has outcome=recovered
+        assert metrics["money_recovered"] == 25000
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 15. Webhook marks recovery as recovered
@@ -1108,6 +1138,80 @@ class TestWebhookEventIdDedup:
                 body2 = res2.json()
                 assert body2["status"] == "duplicate"
                 assert body2["duplicate"] is True
+        finally:
+            app.dependency_overrides.clear()
+
+
+class TestWebhookHeaderDedup:
+    @pytest.mark.asyncio
+    async def test_x_razorpay_event_id_header_used_for_dedup(self, test_session: AsyncSession):
+        """Duplicate delivery with same x-razorpay-event-id header is deduplicated."""
+        async def override_get_db():
+            yield test_session
+        app.dependency_overrides[get_db] = override_get_db
+
+        try:
+            webhook_payload = {
+                "event": "payment.failed",
+                "payload": {
+                    "payment": {
+                        "entity": {
+                            "id": "pay_hdr_dedup_001",
+                            "amount": 7500,
+                            "currency": "INR",
+                            "status": "failed",
+                        }
+                    }
+                },
+            }
+            headers = {"x-razorpay-event-id": "evt_header_dedup_001"}
+
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+                res1 = await ac.post("/api/v1/webhooks/razorpay", json=webhook_payload, headers=headers)
+                assert res1.status_code == 200
+                assert res1.json()["duplicate"] is False
+
+                # Second delivery with same header — should be deduplicated
+                res2 = await ac.post("/api/v1/webhooks/razorpay", json=webhook_payload, headers=headers)
+                assert res2.status_code == 200
+                assert res2.json()["duplicate"] is True
+        finally:
+            app.dependency_overrides.clear()
+
+    @pytest.mark.asyncio
+    async def test_header_takes_precedence_over_body_id(self, test_session: AsyncSession):
+        """x-razorpay-event-id header is used even when body has a different 'id'."""
+        async def override_get_db():
+            yield test_session
+        app.dependency_overrides[get_db] = override_get_db
+
+        try:
+            webhook_payload = {
+                "id": "evt_body_only",
+                "event": "payment.failed",
+                "payload": {
+                    "payment": {
+                        "entity": {
+                            "id": "pay precedence_001",
+                            "amount": 3000,
+                            "currency": "INR",
+                            "status": "failed",
+                        }
+                    }
+                },
+            }
+            headers = {"x-razorpay-event-id": "evt_header_only"}
+
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+                res1 = await ac.post("/api/v1/webhooks/razorpay", json=webhook_payload, headers=headers)
+                assert res1.status_code == 200
+                assert res1.json()["duplicate"] is False
+
+                # Same header, different body id — still deduplicated
+                payload2 = {**webhook_payload, "id": "evt_different_body"}
+                res2 = await ac.post("/api/v1/webhooks/razorpay", json=payload2, headers=headers)
+                assert res2.status_code == 200
+                assert res2.json()["duplicate"] is True
         finally:
             app.dependency_overrides.clear()
 

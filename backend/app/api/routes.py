@@ -275,8 +275,11 @@ async def razorpay_webhook(
     payload_dict = json.loads(raw_body)
     payload = RazorpayWebhookPayload.model_validate(payload_dict)
 
-    # Extract Razorpay's unique event ID for deduplication
-    razorpay_event_id = payload_dict.get("id")
+    # Extract Razorpay's unique event ID for deduplication.
+    # Razorpay provides this in the x-razorpay-event-id header on each
+    # webhook delivery.  Fall back to the JSON body "id" field for
+    # backward-compatibility with older test fixtures.
+    razorpay_event_id = request.headers.get("x-razorpay-event-id") or payload_dict.get("id")
 
     # Extract payment entity from the Razorpay payload
     payment_entity = None
@@ -469,12 +472,16 @@ async def recover_payment(
     # event or a recovery_attempt row — this prevents burning the
     # bounded attempt counter on informational decisions.
     if decision.action == "no_action":
+        next_action_label = (
+            "No Further Action" if decision.bounded
+            else "Available"
+        )
         logger.info("No recovery action for %s: %s", payment_id, decision.reason)
         return RecoveryAttemptResponse(
             id=0,
             payment_id=payment_id,
             action="no_action",
-            status="executed",
+            status="not_applicable",
             reason=decision.reason,
             attempt_number=decision.attempt_number,
             created_at=datetime.now(timezone.utc),
@@ -484,6 +491,7 @@ async def recover_payment(
                 explanation=diagnosis.explanation,
                 supporting_event=diagnosis.supporting_event,
             ),
+            next_action=next_action_label,
         )
 
     # ── Execute action ────────────────────────────────────────────────
@@ -584,6 +592,30 @@ async def recover_payment(
         explanation=diagnosis.explanation,
         supporting_event=diagnosis.supporting_event,
     )
+
+    # Compute next_action: what would the engine decide on the NEXT call?
+    # After executing an action, previous_attempts will be attempt_number.
+    # We re-run the decision logic to determine the next step.
+    next_decision = decide_action(
+        events=event_dicts,
+        risk_score=risk_score,
+        risk_label=risk_label,
+        previous_attempts=decision.attempt_number,
+    )
+    if next_decision.action == "no_action":
+        response.next_action = (
+            "No Further Action" if next_decision.bounded
+            else "Available"
+        )
+    elif next_decision.action == "escalate":
+        response.next_action = "Escalate"
+    elif next_decision.action == "retry_payment":
+        response.next_action = "Retry Payment"
+    elif next_decision.action == "send_reminder":
+        response.next_action = "Send Reminder"
+    else:
+        response.next_action = "Available"
+
     return response
 
 
