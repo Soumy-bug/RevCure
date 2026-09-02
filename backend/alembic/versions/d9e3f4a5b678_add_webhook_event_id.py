@@ -1,10 +1,3 @@
-"""add_webhook_event_id
-
-Revision ID: d9e3f4a5b678
-Revises: c8f2a1d3e456
-Create Date: 2026-08-28 10:00:00.000000
-
-"""
 from typing import Sequence, Union
 
 from alembic import op

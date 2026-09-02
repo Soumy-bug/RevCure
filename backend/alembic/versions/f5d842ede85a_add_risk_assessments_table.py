@@ -1,10 +1,3 @@
-"""add_risk_assessments_table
-
-Revision ID: f5d842ede85a
-Revises: 5d2aa286de87
-Create Date: 2026-08-27 17:22:44.701275
-
-"""
 from typing import Sequence, Union
 
 from alembic import op

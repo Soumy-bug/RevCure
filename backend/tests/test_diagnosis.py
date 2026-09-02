@@ -1,14 +1,3 @@
-"""
-Tests for the constrained diagnosis layer.
-
-Verifies:
-1. Common payment failure diagnosis (bank_timeout, insufficient_funds, etc.)
-2. Timeout / insufficient-funds classification from error codes
-3. Unknown classification when no pattern matches
-4. Diagnosis does NOT bypass recovery limits
-5. Deterministic policy (decide_action) still controls final action
-"""
-
 import pytest
 import pytest_asyncio
 from unittest.mock import patch, AsyncMock, MagicMock

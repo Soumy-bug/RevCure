@@ -1,10 +1,3 @@
-"""add_recovery_outcome_tracking
-
-Revision ID: c8f2a1d3e456
-Revises: b475926cf903
-Create Date: 2026-08-27 18:30:00.000000
-
-"""
 from typing import Sequence, Union
 
 from alembic import op

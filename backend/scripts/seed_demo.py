@@ -1,15 +1,3 @@
-"""
-RevCure Demo Seed Script
-========================
-Creates realistic payment/event data for the Razorpay Buildathon Track 03 demo.
-
-Run:
-    cd backend && python -m scripts.seed_demo
-
-Idempotent: safe to run repeatedly — skips payments that already exist.
-All demo payment IDs are prefixed with "pay_demo_" for easy identification.
-"""
-
 import asyncio
 import sys
 from datetime import datetime, timedelta, timezone

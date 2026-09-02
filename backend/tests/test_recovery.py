@@ -1,11 +1,3 @@
-"""
-Tests for the recovery workflow, Razorpay integration, configuration,
-and error-handling hardening.
-
-All tests use in-memory SQLite and mocked external calls — no real
-Razorpay credentials or network access required.
-"""
-
 import pytest
 import pytest_asyncio
 from unittest.mock import patch, AsyncMock, MagicMock

@@ -1,10 +1,3 @@
-"""add_recovery_attempts_table
-
-Revision ID: b475926cf903
-Revises: f5d842ede85a
-Create Date: 2026-08-27 17:58:14.340137
-
-"""
 from typing import Sequence, Union
 
 from alembic import op
